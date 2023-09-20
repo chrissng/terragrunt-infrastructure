@@ -1,0 +1,38 @@
+name: Terragrunt operation (Demo env)
+
+on:
+  workflow_dispatch: {}
+  merge_group:
+    types:
+      - checks_requested
+  pull_request:
+    types:
+      # PR is created
+      - opened
+      # commit(s) pushed to the PR
+      - synchronize
+      # closed PR is reopened
+      - reopened
+      # title, body, or the base branch of the PR is modified
+      # - edited
+      # PR is closed or merged
+      - closed
+    branches:
+      - master
+    paths:
+      - "aws/terragrunt/demo/**/*.tf"
+      - "aws/terragrunt/demo/**/*.tfvars"
+      - "aws/terragrunt/demo/**/*.hcl"
+
+concurrency:
+  demo
+
+jobs:
+  release:
+    uses: ./.github/workflows/_reusable_workflow_terragrunt.yaml
+    with:
+      environment: aws
+      working_directory: aws/terragrunt/demo
+      cache_key_prefix: demo-
+      iam_role_to_assume: "arn:aws:iam::999999999999:role/github"
+    secrets: inherit

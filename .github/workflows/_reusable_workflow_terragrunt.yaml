@@ -1,0 +1,653 @@
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      working_directory:
+        required: true
+        type: string
+      iam_role_to_assume:
+        required: true
+        type: string
+      cache_key_prefix:
+        required: false
+        type: string
+        default: iac-
+      plan_only:
+        description: Whether to plan only and skip apply/destroy
+        required: false
+        type: boolean
+        default: false
+      migrate_skip_outputs:
+        description: Whether to skip outputs in Terragrunt during migration
+        required: false
+        type: boolean
+        default: true
+
+env:
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.cache/.terraform.d/plugin-cache
+
+jobs:
+  determine-operation-type:
+    name: Determine operation type
+    runs-on: ubuntu-22.04
+
+    outputs:
+      type: ${{ steps.determine-operation-type.outputs.type }}
+      destroy_list: ${{ steps.check-destroy.outputs.destroy-list }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Check migrate here
+        id: check-migrate-here
+        uses: tj-actions/changed-files@v36.4.1
+        with:
+          dir_names: "true"
+          files: |
+            ${{ inputs.working_directory }}/tfmigrate/*.hcl
+
+      - name: Check migrate elsewhere
+        id: check-migrate-elsewhere
+        uses: tj-actions/changed-files@v36.4.1
+        with:
+          dir_names: "true"
+          files: |
+            aws/terragrunt/**/tfmigrate/*.hcl
+            !${{ inputs.working_directory }}/tfmigrate/*.hcl
+
+      - name: Check destroy
+        id: check-destroy
+        run: |
+          git diff \
+              --diff-filter=Md \
+              -G'prevent_destroy\s*=\s*false' \
+              --dirstat=files,0 \
+              origin/${{ github.base_ref }}...origin/${{ github.head_ref }} \
+            | sed 's/^[ 0-9.]\+% //g' \
+            | tee ${{ runner.temp }}/.destroy_list
+          DESTROY_LIST=$(cat ${{ runner.temp }}/.destroy_list)
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "destroy-list<<$EOF" >> "$GITHUB_OUTPUT"
+          cat ${{ runner.temp }}/.destroy_list >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+      # Predence of operations
+      # 1. Migrate (skipped if migration is happening in the other workflow)
+      # 2. Apply
+      # 3. Destroy
+      - name: Determine operation type
+        id: determine-operation-type
+        env:
+          MIGRATE_ELSEWHERE: ${{ steps.check-migrate-elsewhere.outputs.any_changed }}
+          MIGRATE_HERE: ${{ steps.check-migrate-here.outputs.any_changed }}
+          DESTROY_LIST: ${{ steps.check-destroy.outputs.destroy_list }}
+        run: |
+          if [[ "${MIGRATE_ELSEWHERE}" = "true" ]]; then
+            echo "type=migrate-elsewhere" >> $GITHUB_OUTPUT
+          elif [[ "${MIGRATE_HERE}" = "true" ]]; then
+            echo "type=migrate" >> $GITHUB_OUTPUT
+          elif [[ -z "${DESTROY_LIST}" ]]; then
+            echo "type=apply" >> $GITHUB_OUTPUT
+          else
+            echo "type=destroy" >> $GITHUB_OUTPUT
+          fi
+
+  migrate:
+    needs: determine-operation-type
+    if: needs.determine-operation-type.outputs.type == 'migrate'
+
+    name: Migrate
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-22.04
+    env:
+      TG_SKIP_OUTPUTS: ${{ inputs.migrate_skip_outputs }}
+      TFMIGRATE_LOG: DEBUG
+      TFMIGRATE_EXEC_PATH: terragrunt
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      init: ${{ steps.init.outputs.init }}
+      init_length: ${{ steps.init.outputs.init-length }}
+      init_outcome: ${{ steps.init.outcome }}
+      plan: ${{ steps.migrate-plan.outputs.plan }}
+      plan_length: ${{ steps.migrate-plan.outputs.plan-length }}
+      plan_outcome: ${{ steps.migrate-plan.outcome }}
+
+    steps:
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ap-northeast-1
+          role-to-assume: ${{ inputs.iam_role_to_assume }}
+
+      # Cache TF Plugin Dir and TG Download Dir
+
+      - name: Create cache dirs
+        id: create-cache-dirs
+        run: |
+          mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+      - name: Configure cache dirs
+        id: configure-cache-dirs
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ inputs.cache_key_prefix }}${{ inputs.environment }}-${{ github.ref }}
+        timeout-minutes: 3
+        continue-on-error: true
+
+      # Setup Terraform, Terragrunt and tfmigrate
+
+      - name: Setup Terraform
+        id: tf-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "~1.4"
+          terraform_wrapper: false
+      - name: Setup Terragrunt
+        id: tg-setup
+        uses: autero1/action-terragrunt@v1.2.0
+        with:
+          terragrunt_version: "0.46.3"
+      - name: Setup tfmigrate
+        # binary path reference: https://github.com/actions/actions-runner-controller/blob/master/runner/actions-runner.ubuntu-20.04.dockerfile#LL125C4-L125C4
+        env:
+          TFMIGRATE_VERSION: "0.3.12"
+        run: |
+          mkdir -p ${HOME}/.local/bin
+          curl -fsSL https://github.com/minamijoyo/tfmigrate/releases/download/v${TFMIGRATE_VERSION}/tfmigrate_${TFMIGRATE_VERSION}_linux_amd64.tar.gz | tar -xzC ${HOME}/.local/bin
+          chmod +x ${HOME}/.local/bin/tfmigrate
+
+      - name: Init
+        id: init
+        run: |
+          set -o pipefail
+          result=0
+          trap 'result=1' ERR
+            terragrunt run-all init \
+              -upgrade \
+              --terragrunt-non-interactive \
+              --terragrunt-include-external-dependencies \
+            | tee ${{ runner.temp }}/init.log
+          INIT_LOG="$(cat ${{ runner.temp }}/init.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "init<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "${INIT_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "init-length=$(wc -m < ${{ runner.temp }}/init.log)" >> $GITHUB_OUTPUT
+          exit "$result"
+
+      - name: Plan (migrate)
+        id: migrate-plan
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == false
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          result=0
+          trap 'result=1' ERR
+            tfmigrate plan 2>&1 | tee ${{ runner.temp }}/plan.log
+          PLAN_LOG="$(cat ${{ runner.temp }}/plan.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "plan<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "${PLAN_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "plan-length=$(wc -m < ${{ runner.temp }}/plan.log)" >> $GITHUB_OUTPUT
+          exit "$result"
+
+      - name: Apply (migrate)
+        id: migrate-apply
+        if: |
+          !cancelled() && github.event.pull_request.merged == true && !inputs.plan_only
+        run: |
+          tfmigrate apply
+
+      - name: Apply
+        id: apply
+        if: |
+          !cancelled() && github.event.pull_request.merged == true && !inputs.plan_only
+        run: |
+          terragrunt run-all apply \
+            --terragrunt-non-interactive \
+            --terragrunt-include-external-dependencies
+
+  plan-and-apply:
+    needs: determine-operation-type
+    if: needs.determine-operation-type.outputs.type == 'apply'
+
+    name: Plan and Apply
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      init: ${{ steps.init.outputs.init }}
+      init_length: ${{ steps.init.outputs.init-length }}
+      init_outcome: ${{ steps.init.outcome }}
+      plan: ${{ steps.plan.outputs.plan }}
+      plan_length: ${{ steps.plan.outputs.plan-length }}
+      plan_outcome: ${{ steps.plan.outcome }}
+
+    steps:
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ap-northeast-1
+          role-to-assume: ${{ inputs.iam_role_to_assume }}
+
+      # Cache TF Plugin Dir and TG Download Dir
+
+      - name: Create cache dirs
+        id: create-cache-dirs
+        run: |
+          mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+      - name: Configure cache dirs
+        id: configure-cache-dirs
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ inputs.cache_key_prefix }}${{ inputs.environment }}-${{ github.ref }}
+        timeout-minutes: 3
+        continue-on-error: true
+
+      # Setup Terraform and Terragrunt
+
+      - name: Setup Terraform
+        id: tf-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "~1.4"
+          terraform_wrapper: false
+      - name: Setup Terragrunt
+        id: tg-setup
+        uses: autero1/action-terragrunt@v1.2.0
+        with:
+          terragrunt_version: "0.46.3"
+
+      - name: Init
+        id: init
+        run: |
+          set -o pipefail
+          result=0
+          trap 'result=1' ERR
+            terragrunt run-all init \
+              -upgrade \
+              -no-color \
+              --terragrunt-non-interactive \
+              --terragrunt-include-external-dependencies \
+            | tee ${{ runner.temp }}/init.log
+          INIT_LOG="$(cat ${{ runner.temp }}/init.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "init<<$EOF" >> "$GITHUB_OUTPUT"
+          if [ "${#INIT_LOG}" -lt 65500 ]; then
+            echo "${INIT_LOG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "${INIT_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "init-length=$(wc -m < ${{ runner.temp }}/init.log)" >> $GITHUB_OUTPUT
+          exit "$result"
+
+      - name: Plan
+        id: plan
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == false
+        run: |
+          set -o pipefail
+          result=0
+          trap 'result=1' ERR
+            terragrunt run-all plan \
+                -input=false \
+                -no-color \
+                --terragrunt-non-interactive \
+                --terragrunt-include-external-dependencies \
+              | tee ${{ runner.temp }}/plan.log
+          PLAN_LOG="$(cat ${{ runner.temp }}/plan.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "plan<<$EOF" >> "$GITHUB_OUTPUT"
+          if [ "${#PLAN_LOG}" -lt 65500 ]; then
+            echo "${PLAN_LOG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "${PLAN_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "plan-length=$(wc -m < ${{ runner.temp }}/plan.log)" >> $GITHUB_OUTPUT
+          exit "$result"
+
+      - name: Apply
+        id: apply
+        if: |
+          !failure() && !cancelled() && github.event.pull_request.merged == true && !inputs.plan_only
+        run: |
+          terragrunt run-all apply \
+            --terragrunt-non-interactive \
+            --terragrunt-include-external-dependencies
+
+  plan-and-destroy:
+    needs: determine-operation-type
+    if: needs.determine-operation-type.outputs.type == 'destroy'
+
+    name: Plan and Destroy
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-22.04
+    env:
+      DESTROY_LIST: ${{ needs.determine-operation-type.outputs.destroy_list }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      init: ${{ steps.init.outputs.init }}
+      init_length: ${{ steps.init.outputs.init-length }}
+      init_outcome: ${{ steps.init.outcome }}
+      plan_destroy: ${{ steps.plan-destroy.outputs.plan-destroy }}
+      plan_destroy_length: ${{ steps.plan-destroy.outputs.plan-destroy-length }}
+      plan_destroy_outcome: ${{ steps.plan-destroy.outcome }}
+
+    steps:
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      # Cache TF Plugin Dir and TG Download Dir
+
+      - name: Create cache dirs
+        id: create-cache-dirs
+        run: |
+          mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+      - name: Configure cache dirs
+        id: configure-cache-dirs
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ inputs.cache_key_prefix }}${{ inputs.environment }}-${{ github.ref }}
+        timeout-minutes: 3
+        continue-on-error: true
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ap-northeast-1
+          role-to-assume: ${{ inputs.iam_role_to_assume }}
+
+      # Setup Terraform and Terragrunt
+
+      - name: Setup Terraform
+        id: tf-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "~1.4" # Make tfenv,tgenv and hashicorp/setup-terraform@v2 independent because of incompatibility of version descriptions.
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        id: tg-setup
+        uses: autero1/action-terragrunt@v1.2.0
+        with:
+          terragrunt_version: "0.46.3"
+
+      - name: Init
+        id: init
+        run: |
+          set -o pipefail
+          for dir in ${DESTROY_LIST}
+          do
+            echo [TG module dir] ${dir}
+            pushd ${dir}
+            terragrunt init \
+                -upgrade \
+                --terragrunt-non-interactive \
+              | tee -a ${{ runner.temp }}/init.log
+            popd
+          done
+          INIT_LOG="$(cat ${{ runner.temp }}/init.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "init<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "${INIT_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "init-length=$(wc -m < ${{ runner.temp }}/init.log)" >> $GITHUB_OUTPUT
+
+      - name: Plan (destroy)
+        id: plan-destroy
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == false
+        run: |
+          set -o pipefail
+          for dir in ${DESTROY_LIST}
+          do
+            echo [TG module dir] ${dir}
+            pushd ${dir}
+            terragrunt plan \
+                -destroy \
+                -input=false \
+                --terragrunt-non-interactive \
+              | tee -a ${{ runner.temp }}/plan-destroy.log
+            popd
+          done
+          PLAN_LOG="$(cat ${{ runner.temp }}/plan-destroy.log)"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "plan-destroy<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "${PLAN_LOG: -65500}" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+          echo "plan-destroy-length=$(wc -m < ${{ runner.temp }}/plan-destroy.log)" >> $GITHUB_OUTPUT
+
+      - name: Apply (destroy)
+        id: apply-destroy
+        if: |
+          !failure() && !cancelled() && github.event.pull_request.merged == true && !inputs.plan_only
+        run: |
+          for dir in ${DESTROY_LIST}
+          do
+            echo [TG module dir] ${dir}
+            pushd ${dir}
+            terragrunt apply \
+              -destroy \
+              -input=false \
+              -auto-approve \
+              --terragrunt-non-interactive
+            popd
+          done
+
+  preview:
+    needs:
+      - determine-operation-type
+      - migrate
+      - plan-and-apply
+      - plan-and-destroy
+    if: |
+      !cancelled() && github.event_name == 'pull_request'
+    name: Preview
+    runs-on: ubuntu-22.04
+
+    env:
+      MERGED: ${{ github.event.pull_request.merged }}
+      COMMENT_SCRIPT: |
+        // Get the existing comments.
+        const { data: comments } = await github.rest.issues.listComments({
+          owner: context.repo.owner,
+          repo: context.repo.repo,
+          issue_number: context.payload.number,
+        })
+
+        // Find any comment already made by the GH Action bot.
+        const ghaComment = await comments.find(comment => comment.user.id === 41898282)
+
+        if (ghaComment) {
+          return await github.rest.issues.updateComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            comment_id: ghaComment.id,
+            body: output
+          })
+        } else {
+          return await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.number,
+            body: output
+          })
+        }
+
+    steps:
+      - name: Migrate output
+        if: |
+          needs.determine-operation-type.outputs.type == 'migrate'
+        uses: actions/github-script@v6
+        env:
+          INIT_OUTPUT: ${{ needs.migrate.outputs.init }}
+          INIT_OUTPUT_LENGTH: ${{ needs.migrate.outputs.init_length }}
+          PLAN_OUTPUT: ${{ needs.migrate.outputs.plan }}
+          PLAN_OUTPUT_LENGTH: ${{ needs.migrate.outputs.plan_length }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `
+            ### Terraform resources to be migrated
+
+            #### Status ➡️ \`${process.env.MERGED == "true" ? "applied" : "plan"}\`
+
+            #### Init ⚙️ \`${{ needs.migrate.outputs.init_outcome }}\`
+
+            <details>
+            <summary>Init output${process.env.INIT_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.INIT_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            #### Migration plan 📖 \`${{ needs.migrate.outputs.plan_outcome }}\`
+
+            <details>
+            <summary>Migration plan output${process.env.PLAN_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.PLAN_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            Check full logs [here](https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/pull/${{ github.event.number }}/checks).`
+
+            ${{ env.COMMENT_SCRIPT }}
+
+      - name: Plan and Apply output
+        if: |
+          needs.determine-operation-type.outputs.type == 'apply'
+        uses: actions/github-script@v6
+        env:
+          INIT_OUTPUT: ${{ needs.plan-and-apply.outputs.init }}
+          INIT_OUTPUT_LENGTH: ${{ needs.plan-and-apply.outputs.init_length }}
+          PLAN_OUTPUT: ${{ needs.plan-and-apply.outputs.plan }}
+          PLAN_OUTPUT_LENGTH: ${{ needs.plan-and-apply.outputs.plan_length }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `
+            ### Terragrunt modules to be applied
+
+            #### Status ➡️ \`${process.env.MERGED == "true" ? "applied" : "plan"}\`
+
+            #### Init ⚙️ \`${{ needs.plan-and-apply.outputs.init_outcome }}\`
+
+            <details>
+            <summary>Init output${process.env.INIT_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.INIT_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            #### Plan 📖 \`${{ needs.plan-and-apply.outputs.plan_outcome }}\`
+
+            <details>
+            <summary>Plan output${process.env.PLAN_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.PLAN_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            Check full logs [here](https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/pull/${{ github.event.number }}/checks).`
+
+            ${{ env.COMMENT_SCRIPT }}
+
+      - name: Plan and Destroy output
+        if: |
+          needs.determine-operation-type.outputs.type == 'destroy'
+        uses: actions/github-script@v6
+        env:
+          DESTROY_LIST: ${{ needs.determine-operation-type.outputs.destroy_list }}
+          INIT_OUTPUT: ${{ needs.plan-and-destroy.outputs.init }}
+          INIT_OUTPUT_LENGTH: ${{ needs.plan-and-destroy.outputs.init_length }}
+          PLAN_DESTROY_OUTPUT: ${{ needs.plan-and-destroy.outputs.plan_destroy }}
+          PLAN_DESTROY_OUTPUT_LENGTH: ${{ needs.plan-and-destroy.outputs.plan_destroy_length }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `
+            ### Terragrunt modules to be destroyed
+
+            #### Status ➡️ \`${process.env.MERGED == "true" ? "applied" : "plan"}\`
+
+            \`\`\`\`diff
+            ${process.env.DESTROY_LIST}
+            \`\`\`\`
+
+            #### Init ⚙️ \`${{ needs.plan-and-destroy.outputs.init_outcome }}\`
+
+            <details>
+            <summary>Init output${process.env.INIT_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.INIT_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            #### Plan (destroy) 📖 \`${{ needs.plan-and-destroy.outputs.plan_destroy_outcome }}\`
+
+            <details>
+            <summary>Plan output${process.env.PLAN_DESTROY_OUTPUT_LENGTH > 65500 ? " (truncated)" : ""}:</summary>
+
+            \`\`\`\`
+            ${process.env.PLAN_DESTROY_OUTPUT}
+            \`\`\`\`
+            </details>
+
+            Check full logs [here](https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/pull/${{ github.event.number }}/checks).`
+
+            ${{ env.COMMENT_SCRIPT }}

@@ -1,0 +1,123 @@
+name: "Terragrunt validation and checks"
+
+on:
+  workflow_dispatch: {}
+  merge_group:
+    types:
+      - checks_requested
+  pull_request:
+    branches:
+      - "master"
+    paths:
+      - "aws/terragrunt/**"
+      - ".github/workflows/terragrunt_validation.yaml"
+
+env:
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.cache/.terraform.d/plugin-cache
+
+defaults:
+  run:
+    working-directory: "aws/terragrunt"
+
+jobs:
+  iac-validate-and-check:
+    name: Validate and check
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: List changed directories
+        id: list-changed-dirs
+        run: |
+          set -o pipefail
+          git diff \
+              --dirstat=files,0 \
+              origin/${{ github.base_ref }}...origin/${{ github.head_ref }} \
+            | sed 's/^[ 0-9.]\+% //g' \
+            | tee ${{ runner.temp }}/changed_dirs
+
+      # Cache Terraform Plugin Dir
+
+      - name: Create TF plugin dir
+        id: tf-create-plugin-dir
+        run: |
+          mkdir -p ${{ env.TF_PLUGIN_CACHE_DIR }}
+      - name: Cache TF plugin dir
+        id: tf-cache-plugin-dir
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tg-validation-${{ github.ref }}
+
+      # Terraform
+
+      - name: Setup Terraform
+        id: tf-setup
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "~1.4"
+          terraform_wrapper: false
+
+      # Terragrunt
+
+      - name: Setup Terragrunt
+        id: tg-setup
+        uses: autero1/action-terragrunt@v1.2.0
+        with:
+          terragrunt_version: "0.46.3"
+
+      - name: Terragrunt hclfmt check
+        id: tg-hclfmt
+        run: terragrunt hclfmt --terragrunt-check
+
+      - name: Terragrunt find all tg root modules
+        id: tg-find-root-modules
+        run: |
+          set -o pipefail
+          find * \
+              -maxdepth 1 \
+              -not -path '*/.terragrunt-cache/*' \
+              -not -path '*/.terraform/*' \
+              -type f -wholename '*/terragrunt.hcl' \
+              -printf '%h\n' \
+            | sort \
+            | uniq \
+            | tee ${{ runner.temp }}/tg_roots
+          for dir in $(cat ${{ runner.temp }}/tg_roots)
+          do
+            rm ${dir}/terragrunt.hcl
+            cp ${GITHUB_WORKSPACE}/.github/mock/local_state_terragrunt.hcl ${dir}/terragrunt.hcl
+          done
+
+      - name: Terragrunt Validate
+        id: tg-validate
+        run: |
+          set -o pipefail
+
+          # List all terragrunt modules
+          find * \
+              -mindepth 2 \
+              -not -path '*/.terragrunt-cache/*' \
+              -not -path '*/.terraform/*' \
+              -type f -wholename '*/terragrunt.hcl' \
+              -printf '%h/\n' \
+            | sort \
+            | uniq \
+            | tee ${{ runner.temp }}/all_tg_modules
+
+          # Validate only the changed terraform modules
+          sort <(cat ${{ runner.temp }}/all_tg_modules) <(cat ${{ runner.temp }}/changed_dirs) \
+            | uniq -d \
+            | xargs -I{} bash -c 'echo [TG module dir] {} && pushd {} && terragrunt validate && popd'
+
+      - name: Terragrunt Validate Inputs (all)
+        id: tg-validate-inputs-all
+        env:
+          TG_SKIP_OUTPUTS: true
+        run: |
+          terragrunt run-all validate-inputs
