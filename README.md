@@ -191,6 +191,14 @@ Two step process:
 1. Final PR to remove the Terragrunt module files completely
     * Workflow will run apply again on the whole project *when the PR is merged and workflow run is approved.*
 
-## Optimizing Github Actions workflow
+*Source: https://github.com/gruntwork-io/terragrunt/issues/1206#issuecomment-892480811*
+
+## Github Actions workflow optimizations
+
+### Selectively running plan/apply on modified modules
 
 Terragrunt operations (plan and apply) are applied per environment. As the number of modules increases within each environment, the execution time also increases. This represents a trade-off between maintaining a very large module (i.e., a large state) and using many small modules. One optimization is to execute `run-all plan/apply` only on modules that have been modified.
+
+### Supporting different types of runners
+
+Currently, GitHub-hosted runners (`ubuntu-22.04`) are in use. The workflow can be modified to accommodate running jobs on larger runners or self-hosted runners. For more information, refer to [this](https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job#overview).
